@@ -1,1 +1,1 @@
-worker: python umbrella.py
+worker: python umbrela.py
