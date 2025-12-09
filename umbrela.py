@@ -1,20 +1,27 @@
-import asyncio
+import os
 import logging
+import asyncio
 import requests
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message
-from aiogram.filters import CommandStart
 
-API_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+if not API_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in environment variables")
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
 
 
 def geocode_city(city: str):
+
     url = "https://geocoding-api.open-meteo.com/v1/search"
     params = {
         "name": city,
@@ -22,15 +29,16 @@ def geocode_city(city: str):
         "language": "en",
         "format": "json",
     }
-    r = requests.get(url, params=params, timeout=10)
-    data = r.json()
+    resp = requests.get(url, params=params, timeout=10)
+    data = resp.json()
     if "results" not in data or not data["results"]:
         return None
     first = data["results"][0]
-    return first["latitude"], first["longitude"], first.get("name")
+    return first["latitude"], first["longitude"], first.get("name", city)
 
 
 def get_rain_forecast(lat: float, lon: float):
+
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
@@ -39,60 +47,83 @@ def get_rain_forecast(lat: float, lon: float):
         "forecast_days": 1,
         "timezone": "auto",
     }
-    r = requests.get(url, params=params, timeout=10)
-    data = r.json()
+    resp = requests.get(url, params=params, timeout=10)
+    data = resp.json()
     hourly = data.get("hourly", {})
-    return list(
-        zip(
-            hourly.get("time", []),
-            hourly.get("precipitation", []),
-            hourly.get("precipitation_probability", []),
-        )
-    )
+    times = hourly.get("time", [])
+    precip = hourly.get("precipitation", [])
+    prob = hourly.get("precipitation_probability", [])
+
+    return list(zip(times, precip, prob))
 
 
 def need_umbrella(hourly_data, hours_ahead: int = 6):
-    for _, precipitation, probability in hourly_data[:hours_ahead]:
-        if (probability and probability >= 30) or (precipitation and precipitation > 0):
+    
+    if not hourly_data:
+        return None
+
+    subset = hourly_data[:hours_ahead]
+    for time_str, precipitation, probability in subset:
+        if (probability is not None and probability >= 30) or (
+            precipitation is not None and precipitation > 0
+        ):
             return True
     return False
 
 
-@dp.message(CommandStart())
-async def start(message: Message):
+
+@router.message(F.text.startswith(("/start", "/help")))
+async def send_welcome(message: Message):
     await message.answer(
-        "Hi! ☂️\n"
-        "Send me a city name and I’ll tell you whether you need an umbrella or not.\n"
-        "Example: Tallinn"
+        "Hi! I am your umbrella bot ☔\n"
+        "Send me a city name and I’ll tell you if you should take an umbrella.\n\n"
+        "Examples:\n"
+        "  Tallinn\n"
+        "  Riga\n"
+        "  London"
     )
 
 
-@dp.message()
-async def umbrella_check(message: Message):
+@router.message()
+async def check_umbrella(message: Message):
     city = message.text.strip()
 
     geo = geocode_city(city)
     if not geo:
-        await message.answer("I can’t find this city 🤔")
+        await message.answer(
+            "I can’t find this city 🤔\n"
+            "Please check the spelling and try again."
+        )
         return
 
-    lat, lon, name = geo
-    hourly = get_rain_forecast(lat, lon)
-    umbrella = need_umbrella(hourly)
+    lat, lon, nice_name = geo
 
-    if umbrella:
+    try:
+        hourly = get_rain_forecast(lat, lon)
+    except Exception as e:
+        logging.exception("Error fetching weather: %s", e)
+        await message.answer("I couldn’t get the weather now 😢 Please try again later.")
+        return
+
+    decision = need_umbrella(hourly, hours_ahead=6)
+    if decision is None:
+        await message.answer("Something went wrong with the forecast 😕")
+        return
+
+    if decision:
         await message.answer(
-            f"In {name}, rain is possible in the next few hours 🌧\n"
-            f"Advice: take an umbrella!"
+            f"In {nice_name} there is a chance of rain in the next 6 hours 🌧\n"
+            f"Better take an umbrella!"
         )
     else:
         await message.answer(
-            f"No rain expected in {name} 🙂\n"
-            f"You can go out without an umbrella."
+            f"In {nice_name} no rain is expected in the next 6 hours 🙂\n"
+            f"You can go without an umbrella."
         )
 
 
 async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 
